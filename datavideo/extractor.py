@@ -4,10 +4,11 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from . import crypto
 from .core import MAGIC as LEGACY_MAGIC, PIXEL_FORMAT, frame_bytes, parse_header
 from .decoder import read_exact
 from .ffmpeg_tools import ffmpeg_path, ffprobe_path
-from .segmenter import DATA_SEGMENT_TITLE, SEGMENT_MAGIC, parse_segment_frame
+from .segmenter import LEGACY_SEGMENT_MAGIC, SEGMENT_MAGIC, parse_segment_frame
 
 
 def probe_streams(video_path):
@@ -59,14 +60,11 @@ def decode_first_frame(video_path, stream):
 def is_data_segment_stream(video_path, stream):
     if stream.get("codec_type") != "video":
         return None
-    tags = stream.get("tags") or {}
-    title = (tags.get("title") or tags.get("TITLE") or "").lower()
-    likely = title.startswith(DATA_SEGMENT_TITLE.lower()) or stream.get("codec_name") == "ffv1"
-    if not likely:
+    if stream.get("codec_name") != "ffv1":
         return None
     try:
         first = decode_first_frame(video_path, stream)
-        if not first.startswith(SEGMENT_MAGIC):
+        if not (first.startswith(SEGMENT_MAGIC) or first.startswith(LEGACY_SEGMENT_MAGIC)):
             return None
         header, _payload = parse_segment_frame(first)
         return header
@@ -92,22 +90,22 @@ def find_data_segment_streams(video_path):
 
 def validate_segment_set(segment_streams):
     if not segment_streams:
-        raise RuntimeError("No distributed DataVideo segment streams were found")
+        raise RuntimeError("No data segment streams were found in the carrier")
     first_header = segment_streams[0][1]
     keys = ["session_id", "file_id", "sha256", "file_size", "total_frames", "total_segments", "width", "height", "header_bytes"]
     for _stream, header in segment_streams:
         for key in keys:
             if header.get(key) != first_header.get(key):
-                raise RuntimeError(f"DataVideo segment metadata mismatch for {key}")
+                raise RuntimeError(f"Segment metadata mismatch for {key}")
     total_segments = int(first_header["total_segments"])
     present = [int(header["segment_index"]) for _stream, header in segment_streams]
     missing = [i for i in range(total_segments) if i not in present]
     if missing:
-        raise RuntimeError("Missing DataVideo segment stream(s): " + ", ".join(str(x) for x in missing[:20]))
+        raise RuntimeError("Missing segment stream(s): " + ", ".join(str(x) for x in missing[:20]))
     return first_header
 
 
-def decode_segment_stream_to_output(video_path, stream, expected_base, expected_global_frame, output, digest, written, progress=True):
+def decode_segment_stream_to_output(video_path, stream, expected_base, expected_global_frame, output, digest, written, decryptor=None, progress=True):
     width = int(stream["width"])
     height = int(stream["height"])
     per_frame = frame_bytes(width, height)
@@ -120,18 +118,21 @@ def decode_segment_stream_to_output(video_path, stream, expected_base, expected_
             if not frame:
                 break
             if len(frame) != per_frame:
-                raise RuntimeError("Truncated DataVideo segment frame")
+                raise RuntimeError("Truncated segment frame")
             header, payload = parse_segment_frame(frame)
             if header.get("session_id") != expected_base.get("session_id"):
-                raise RuntimeError("DataVideo session mismatch")
+                raise RuntimeError("Carrier session id mismatch")
             global_index = int(header["global_frame_index"])
             if global_index != expected_global_frame:
                 raise RuntimeError(f"Unexpected global frame index {global_index}; expected {expected_global_frame}")
             file_size = int(expected_base["file_size"])
             take = min(len(payload), file_size - written)
             if take > 0:
-                output.write(payload[:take])
-                digest.update(payload[:take])
+                chunk = bytes(payload[:take])
+                if decryptor is not None:
+                    chunk = decryptor.update(chunk)
+                output.write(chunk)
+                digest.update(chunk)
                 written += take
             expected_global_frame += 1
             frames_decoded += 1
@@ -155,15 +156,24 @@ def decode_segment_stream_to_output(video_path, stream, expected_base, expected_
     return expected_global_frame, written
 
 
-def extract_distributed_segments(video_path, output_path, progress=True):
+def extract_distributed_segments(video_path, output_path, password=None, progress=True):
     segment_streams = find_data_segment_streams(video_path)
     base = validate_segment_set(segment_streams)
+    decryptor = None
+    if base.get("encrypted"):
+        if password is None:
+            raise RuntimeError("This carrier is encrypted. Provide --password to extract.")
+        salt = crypto.b64d(base["enc_salt"])
+        nonce = crypto.b64d(base["enc_nonce"])
+        iterations = int(base.get("kdf_iterations", crypto.DEFAULT_KDF_ITERATIONS))
+        decryptor = crypto.decryptor(password, salt, nonce, iterations=iterations)
     digest = hashlib.sha256()
     written = 0
     expected_global_frame = 0
     if progress:
-        print(f"found distributed DataVideo segments: {len(segment_streams)}")
+        print(f"found data segments: {len(segment_streams)}")
         print("session:", base["session_id"])
+        print("encryption:", "on" if base.get("encrypted") else "off")
     with open(output_path, "wb") as output:
         for stream, header in segment_streams:
             base_with_current = dict(base)
@@ -176,16 +186,19 @@ def extract_distributed_segments(video_path, output_path, progress=True):
                 output,
                 digest,
                 written,
+                decryptor=decryptor,
                 progress=progress,
             )
     total_frames = int(base["total_frames"])
     if expected_global_frame != total_frames:
-        raise RuntimeError(f"Missing DataVideo frames: decoded {expected_global_frame}, expected {total_frames}")
+        raise RuntimeError(f"Missing data frames: decoded {expected_global_frame}, expected {total_frames}")
     file_size = int(base["file_size"])
     if written != file_size:
         raise RuntimeError(f"Recovered file size mismatch: wrote {written}, expected {file_size}")
     actual_hash = digest.hexdigest()
     if actual_hash != base["sha256"]:
+        if base.get("encrypted"):
+            raise RuntimeError("SHA256 mismatch. Wrong password or the carrier video was modified.")
         raise RuntimeError("SHA256 mismatch. The carrier video was changed or decoded incorrectly.")
     return base
 
@@ -274,8 +287,11 @@ def extract_legacy_track(video_path, output_path, progress=True):
         raise
 
 
-def extract_auto(video_path, output_path, progress=True):
+def extract_auto(video_path, output_path, password=None, identity_privkey=None, progress=True):
+    from .stego_carrier import extract_stego, is_stego_carrier
+    if is_stego_carrier(video_path):
+        return extract_stego(video_path, output_path, password=password, identity_privkey=identity_privkey, progress=progress)
     segments = find_data_segment_streams(video_path)
     if segments:
-        return extract_distributed_segments(video_path, output_path, progress=progress)
+        return extract_distributed_segments(video_path, output_path, password=password, progress=progress)
     return extract_legacy_track(video_path, output_path, progress=progress)

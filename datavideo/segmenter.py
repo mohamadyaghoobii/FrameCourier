@@ -11,13 +11,14 @@ import zlib
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import crypto
 from .core import CHANNELS, DEFAULT_FPS, DEFAULT_HEIGHT, DEFAULT_WIDTH, PIXEL_FORMAT, frame_bytes, pad_frame
 from .ffmpeg_tools import ffmpeg_path
 
-SEGMENT_MAGIC = b"DVS1"
-SEGMENT_VERSION = 1
+SEGMENT_MAGIC = b"\xfc\x46\x43\x02"
+LEGACY_SEGMENT_MAGIC = b"DVS1"
+SEGMENT_VERSION = 2
 DEFAULT_SEGMENT_HEADER_BYTES = 8192
-DATA_SEGMENT_TITLE = "DataVideoSegment"
 
 
 @dataclass(frozen=True)
@@ -107,7 +108,6 @@ def sha256_file(path, chunk_size=8 * 1024 * 1024):
 def make_frame_header(base_meta, segment_range, global_frame_index, frame_index_in_segment, payload):
     header = dict(base_meta)
     header.update({
-        "magic": SEGMENT_MAGIC.decode("ascii"),
         "version": SEGMENT_VERSION,
         "segment_index": segment_range.index,
         "segment_first_global_frame": segment_range.first_frame,
@@ -122,38 +122,37 @@ def make_frame_header(base_meta, segment_range, global_frame_index, frame_index_
     prefix = SEGMENT_MAGIC + struct.pack(">I", len(raw)) + struct.pack(">I", header_crc) + raw
     header_bytes = int(base_meta["header_bytes"])
     if len(prefix) > header_bytes:
-        raise ValueError("DataVideo segment frame header is too large")
+        raise ValueError("Segment frame header is too large")
     return prefix + (b"\x00" * (header_bytes - len(prefix)))
 
 
 def parse_segment_frame(frame):
     if len(frame) < 12:
-        raise ValueError("Frame is too small for DataVideo segment header")
-    if frame[:4] != SEGMENT_MAGIC:
-        raise ValueError("Bad DataVideo segment magic")
+        raise ValueError("Frame is too small for a segment header")
+    magic = frame[:4]
+    if magic != SEGMENT_MAGIC and magic != LEGACY_SEGMENT_MAGIC:
+        raise ValueError("Bad segment magic")
     raw_len = struct.unpack(">I", frame[4:8])[0]
     expected_crc = struct.unpack(">I", frame[8:12])[0]
     if raw_len <= 0 or raw_len > len(frame) - 12:
-        raise ValueError("Invalid DataVideo segment header length")
+        raise ValueError("Invalid segment header length")
     raw = frame[12:12 + raw_len]
     actual_crc = zlib.crc32(raw) & 0xffffffff
     if actual_crc != expected_crc:
-        raise ValueError("DataVideo segment header CRC mismatch")
+        raise ValueError("Segment header CRC mismatch")
     header = json.loads(raw.decode("utf-8"))
-    if header.get("magic") != SEGMENT_MAGIC.decode("ascii"):
-        raise ValueError("Invalid DataVideo segment header magic")
-    if int(header.get("version", -1)) != SEGMENT_VERSION:
-        raise ValueError("Unsupported DataVideo segment version")
+    if int(header.get("version", -1)) not in (1, SEGMENT_VERSION):
+        raise ValueError("Unsupported segment version")
     header_bytes = int(header["header_bytes"])
     payload_len = int(header["payload_length"])
     if header_bytes < 12 or header_bytes > len(frame):
-        raise ValueError("Invalid DataVideo segment header_bytes")
+        raise ValueError("Invalid segment header_bytes")
     if payload_len < 0 or header_bytes + payload_len > len(frame):
-        raise ValueError("Invalid DataVideo segment payload length")
+        raise ValueError("Invalid segment payload length")
     payload = frame[header_bytes:header_bytes + payload_len]
     actual_payload_crc = zlib.crc32(payload) & 0xffffffff
     if actual_payload_crc != int(header["payload_crc32"]):
-        raise ValueError("DataVideo segment payload CRC mismatch")
+        raise ValueError("Segment payload CRC mismatch")
     return header, payload
 
 
@@ -207,7 +206,7 @@ def encode_one_segment(input_stream, segment_range, base_meta, output_path, widt
         print(f"encoded segment {segment_range.index + 1}/{base_meta['total_segments']} frames={segment_range.frame_count}")
 
 
-def encode_distributed_segments(input_path, output_dir, requested_segments=100, schedule="even", cover_duration=1.0, seed=1337, width=DEFAULT_WIDTH, height=DEFAULT_HEIGHT, fps=DEFAULT_FPS, header_bytes=DEFAULT_SEGMENT_HEADER_BYTES, progress=True):
+def encode_distributed_segments(input_path, output_dir, requested_segments=1, schedule="even", cover_duration=1.0, seed=1337, width=DEFAULT_WIDTH, height=DEFAULT_HEIGHT, fps=DEFAULT_FPS, header_bytes=DEFAULT_SEGMENT_HEADER_BYTES, password=None, progress=True):
     input_path = Path(input_path)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -219,10 +218,8 @@ def encode_distributed_segments(input_path, output_dir, requested_segments=100, 
     session_id = str(uuid.uuid4())
     file_id = file_hash[:32]
     base_meta = {
-        "format": "DataVideoDistributedSegment",
         "session_id": session_id,
         "file_id": file_id,
-        "source_file_name": input_path.name,
         "file_size": file_size,
         "sha256": file_hash,
         "total_frames": total_frames,
@@ -233,18 +230,29 @@ def encode_distributed_segments(input_path, output_dir, requested_segments=100, 
         "width": width,
         "height": height,
         "fps": fps,
-        "pixel_format": PIXEL_FORMAT,
         "channels": CHANNELS,
         "frame_bytes": frame_bytes(width, height),
         "header_bytes": header_bytes,
         "payload_capacity": payload_capacity(width, height, header_bytes),
-        "codec": "ffv1",
-        "container": "matroska",
     }
+    enc_obj = None
+    if password is not None:
+        salt = crypto.new_salt()
+        nonce = crypto.new_nonce()
+        enc_obj = crypto.encryptor(password, salt, nonce)
+        base_meta.update({
+            "encrypted": True,
+            "kdf": crypto.KDF_NAME,
+            "kdf_iterations": crypto.DEFAULT_KDF_ITERATIONS,
+            "cipher": crypto.CIPHER_NAME,
+            "enc_salt": crypto.b64e(salt),
+            "enc_nonce": crypto.b64e(nonce),
+        })
     encoded = []
-    with open(input_path, "rb") as input_stream:
+    with open(input_path, "rb") as raw_stream:
+        input_stream = crypto.EncryptingReader(raw_stream, enc_obj) if enc_obj else raw_stream
         for segment_range, offset in zip(ranges, offsets):
-            seg_path = output_dir / f"datavideo_segment_{segment_range.index:05d}.mkv"
+            seg_path = output_dir / f"_seg_{segment_range.index:05d}.mkv"
             encode_one_segment(input_stream, segment_range, base_meta, seg_path, width, height, fps, progress=progress)
             encoded.append(EncodedSegment(segment_range.index, seg_path, float(offset), segment_range.first_frame, segment_range.frame_count))
     return base_meta, encoded

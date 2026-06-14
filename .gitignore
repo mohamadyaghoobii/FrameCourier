@@ -1,31 +1,79 @@
-﻿.venv/
-.claude/
+# Python
 __pycache__/
-.pytest_cache/
 *.pyc
 *.pyo
 *.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
 
+# Virtual envs
+.venv/
+venv/
+env/
+
+# IDE / editor
+.vscode/
+.idea/
+.claude/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# FFmpeg binaries (users supply their own)
 bin/
-default/default.mp4
+ffmpeg.exe
+ffprobe.exe
+ffplay.exe
 
-*.mkv
-*.mp4
-*.avi
-*.mov
-*.webm
+# Default / generated covers (users supply their own)
+default/*.mp4
+default/*.mkv
+default/*.webm
 
-*.bin
-*.rar
-*.zip
-*.7z
+# Carriers / payloads / test artifacts in the repo root
+/*.mp4
+/*.mkv
+/*.mov
+/*.avi
+/*.webm
+/*.bin
+/*.zip
+/*.rar
+/*.7z
+/sample.txt
+/sample_recovered.txt
+/recovered.txt
+/recovered*.bin
+/carrier*.mp4
+/sample_carrier*
+/sample_recovered*
+/random_*
+/datavideo_segments_*/
 
-*_carrier*
-*_recovered*
-random_*
-sample.txt
-sample_recovered.txt
+# Signature blobs and key files (NEVER commit private keys)
+*.sig
+*.key
+*.pub
+*.age
+*.ed25519
+*.x25519
 
-datavideo_segments_*/
-README.backup.md
+# Audit logs and configs
+audit.log
+*.audit.log
+audit*.jsonl
+config.json
+
+# Backups
+*.backup
+*.bak
 *.disabled
+README.backup.md

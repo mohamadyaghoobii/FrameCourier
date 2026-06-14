@@ -41,11 +41,11 @@ def calculate_total_frames(file_size, width, height, header_bytes):
     return 1 + math.ceil((file_size - first_payload) / per_frame)
 
 
-def make_metadata(input_path, width, height, fps, header_bytes, file_hash):
+def make_metadata(input_path, width, height, fps, header_bytes, file_hash, encryption=None):
     size = os.path.getsize(input_path)
     total_frames = calculate_total_frames(size, width, height, header_bytes)
     per_frame = frame_bytes(width, height)
-    return {
+    meta = {
         "magic": MAGIC.decode("ascii"),
         "version": VERSION,
         "codec": "ffv1",
@@ -65,6 +65,19 @@ def make_metadata(input_path, width, height, fps, header_bytes, file_hash):
         "total_frames": total_frames,
         "created_utc": datetime.now(timezone.utc).isoformat()
     }
+    if encryption:
+        meta["encrypted"] = True
+        meta["enc_layer"] = encryption["layer"]
+        meta["enc_kdf"] = encryption["kdf"]
+        meta["enc_salt"] = encryption["salt_b64"]
+        meta["enc_nonce"] = encryption["nonce_b64"]
+        if "argon2_time" in encryption:
+            meta["enc_argon2_time"] = encryption["argon2_time"]
+            meta["enc_argon2_memory_kb"] = encryption["argon2_memory_kb"]
+            meta["enc_argon2_parallelism"] = encryption["argon2_parallelism"]
+        if "pbkdf2_iterations" in encryption:
+            meta["enc_pbkdf2_iterations"] = encryption["pbkdf2_iterations"]
+    return meta
 
 
 def pack_header(metadata, header_bytes):
